@@ -1,0 +1,102 @@
+kernel/sched/sched.h
+lines 1558
+extern const struct sched_class stop_sched_class;
+extern const struct sched_class dl_sched_class;
+extern const struct sched_class rt_sched_class;
+extern const struct sched_class fair_sched_class;
+extern const struct sched_class idle_sched_class;
+
+lines 1476
+struct sched_class {
+	const struct sched_class *next;
+
+	void (*enqueue_task) (struct rq *rq, struct task_struct *p, int flags); // 프로세스가 실행 가능한 상태로 진입
+	void (*dequeue_task) (struct rq *rq, struct task_struct *p, int flags); // 프로세스가 더 이상 실행 가능한 상태가 아닐때
+	void (*yield_task)   (struct rq *rq); // 프로세스가 스스로 yield() 시스템콜을 실행했을 때
+	bool (*yield_to_task)(struct rq *rq, struct task_struct *p, bool preempt); 현재 프로세서를 다른 스레드에 양보하거나 스레드를 프로세서쪽으로 가속시킴
+
+	void (*check_preempt_curr)(struct rq *rq, struct task_struct *p, int flags); // 현재 실행 중인 프로세스를 선점할 수 있는지 검사
+
+	/*
+	 * It is the responsibility of the pick_next_task() method that will
+	 * return the next task to call put_prev_task() on the @prev task or
+	 * something equivalent.
+	 *
+	 * May return RETRY_TASK when it finds a higher prio class has runnable
+	 * tasks.
+	 */
+	struct task_struct * (*pick_next_task)(struct rq *rq, struct task_struct *prev,  struct rq_flags *rf); //실행할 다음 프로세스를 선택
+	void (*put_prev_task)(struct rq *rq, struct task_struct *p); // 실행중인 태스크를 다시 내부 자료구조에 큐잉
+
+#ifdef CONFIG_SMP // SMP설정일 때 (symmetric multiprocessing)
+	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags); //  wake 또는 fork 밸런싱인 경우에만 가장 낮은 우선 순위부터 요청한 태스크의 우선순위 범위 이내에서 동작할 수 있는 cpu를 찾아 선택한다.
+	void (*migrate_task_rq)(struct task_struct *p); 
+
+	void (*task_woken)(struct rq *this_rq, struct task_struct *task); // task가 실행중이지 않고 조정하지 않는다면 밀어낸다
+
+	void (*set_cpus_allowed)(struct task_struct *p, const struct cpumask *newmask); // 요청 태스크가 운영될 수 있는 cpu들을 지정한다
+
+	void (*rq_online)(struct rq *rq); // rq 온라인 설정
+	void (*rq_offline)(struct rq *rq); // rq 오프라인 설정
+#endif
+
+	void (*set_curr_task)(struct rq *rq);  //태스크의 스케줄링 클래스나 태스크 그룹을 바꿀때
+	void (*task_tick)(struct rq *rq, struct task_struct *p, int queued); // 타이머 틱 함수가 호출
+	void (*task_fork)(struct task_struct *p); // cfs인 경우 fork 된 새 child task의 vruntime을 결정해준다.
+	void (*task_dead)(struct task_struct *p); // dl인 경우 total_bw 속 dl_bw 감소후 dl 타이머를 중지시켜준다.
+
+	/*
+	 * The switched_from() call is allowed to drop rq->lock, therefore we
+	 * cannot assume the switched_from/switched_to pair is serliazed by
+	 * rq->lock. They are however serialized by p->pi_lock.
+	 */
+	void (*switched_from)(struct rq *this_rq, struct task_struct *task); // from으로부터 policy 교체, 큐에 있는 마지막 작업이면 pull을 통해 다른 작업을 불러온다.
+	void (*switched_to)  (struct rq *this_rq, struct task_struct *task); // to로 policy 교체
+	void (*prio_changed) (struct rq *this_rq, struct task_struct *task, int oldprio); //  task의 priority가 같은 type 내에서 바뀔 때 호출
+
+	unsigned int (*get_rr_interval)(struct rq *rq, struct task_struct *task); // rt클래스에서 사용 rr인 경우 인터벌을 리턴하고 fifo인 경우 0 리턴
+
+	void (*update_curr)(struct rq *rq);// 현재 런타임을 업데이트한다.
+
+#define TASK_SET_GROUP		0
+#define TASK_MOVE_GROUP		1
+
+#ifdef CONFIG_FAIR_GROUP_SCHED // cgroup의 cfs 그룹 스케줄링을 지원하는 커널 옵션
+
+	void (*task_change_group)(struct task_struct *p, int type);
+#endif
+};
+
+kernel/sched/rt.c
+lines 2366
+const struct sched_class rt_sched_class = {
+	.next			= &fair_sched_class, // 우선순위 순서 stop -> dl -> rt -> fair -> idle (for_each_class)
+	.enqueue_task		= enqueue_task_rt, // 프로세스가 실행 가능한 상태로 진입
+	.dequeue_task		= dequeue_task_rt, //프로세스가 더 이상 실행 가능한 상태가 아닐때
+	.yield_task		= yield_task_rt, //프로세스가 스스로 yield() 시스템콜을 실행했을 때
+
+	.check_preempt_curr	= check_preempt_curr_rt,//현재 실행 중인 프로세스를 선점할 수 있는지 검사
+
+	.pick_next_task		= pick_next_task_rt,//실행할 다음 프로세스를 선택
+	.put_prev_task		= put_prev_task_rt,//실행중인 태스크를 다시 내부 자료구조에 큐잉
+
+#ifdef CONFIG_SMP
+	.select_task_rq		= select_task_rq_rt, // wake 또는 fork 밸런싱인 경우에만 가장 낮은 우선 순위부터 요청한 태스크의 우선순위 범위 이내에서 동작할 수 있는 cpu를 찾아 선택한다.
+
+	.set_cpus_allowed       = set_cpus_allowed_common, //요청 태스크가 운영될 수 있는 cpu들을 지정한다
+	.rq_online              = rq_online_rt, // rq 온라인 설정
+	.rq_offline             = rq_offline_rt, // rq 오프라인 설정
+	.task_woken		= task_woken_rt, // task가 실행중이지 않고 조정하지 않는다면 밀어낸다
+	.switched_from		= switched_from_rt, // rt에서 클래스 바꿈 큐에 있는 마지막 작업이면 pull을 통해 다른 작업을 불러온다.
+#endif
+
+	.set_curr_task          = set_curr_task_rt, //태스크의 스케줄링 클래스나 태스크 그룹을 바꿀때
+	.task_tick		= task_tick_rt, // 타이머 틱 함수가 호출
+
+	.get_rr_interval	= get_rr_interval_rt, // rr인 경우 인터벌 리턴, fifo인 경우 0 리턴
+
+	.prio_changed		= prio_changed_rt, //  task의 priority가 같은 type 내에서 바뀔 때 호출
+	.switched_to		= switched_to_rt, // rt클래스로 switch함
+
+	.update_curr		= update_curr_rt, // 현재 런타임을 업데이트한다.
+};

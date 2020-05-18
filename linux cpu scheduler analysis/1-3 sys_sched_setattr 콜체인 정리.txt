@@ -1,0 +1,571 @@
+include/linux/syscall.h
+869 lines
+asmlinkage long sys_sched_setattr(pid_t pid, struct sched_attr __user *attr, unsigned int flags); 	선언
+
+kernel/sched/core.c
+4578 lines
+SYSCALL_DEFINE3(sched_setattr, pid_t pid, struct sched_attr __user * uattr, unsigned int flags) 	// 시스템 호출 핸들러 매크로3
+{
+	struct sched_attr attr;
+	struct task_struct *p;
+	int retval;
+
+	if (!uattr || pid < 0 || flags) 
+		return -EINVAL;  // arch/powerpc/boot/stdio.h /* Invalid argument */
+				
+	retval = sched_copy_attr(uattr, &attr);  //attr에 uattr 인자로 넘어온 구조체를 복사한다. 정상 수행시 0 리턴
+	if (retval)
+		return retval;
+
+	if ((int)attr.sched_policy < 0)
+		return -EINVAL;
+   					// RCU(Read Copy Update)는 읽는 작업이 주로 이루어지는 자료구조를 보호하기 위한 또 하나의 동기화 기법이다. 다른 동기화 방법과는 다르게 락이나 카운터를 사용하지 않는다.
+	rcu_read_lock();    //RCU에서 데이터를 참조하기 위한 Critical Section을 시작 했다는 것을 통지한다.
+	retval = -ESRCH;   /* No such process */
+	p = find_process_by_pid(pid); // pid를 받아옴
+	if (p != NULL)
+		retval = sched_setattr(p, &attr);
+	rcu_read_unlock();  // RCU에서 데이터의 참조가 끝난것을 통지한다.
+
+	return retval;
+}
+
+kernel/sched/core.c
+4477 lines
+
+static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *attr)
+{
+	u32 size;
+	int ret;
+
+	if (!access_ok(VERIFY_WRITE, uattr, SCHED_ATTR_SIZE_VER0)) // 유저 프로세스 공간으로의 안전한 접근이 가능한지 확인하는 함수
+		return -EFAULT; // uapi/asm-generic/errno-base.h /* Bad address */
+
+	/* Zero the full structure, so that a short copy will be nice: */
+	memset(attr, 0, sizeof(*attr));
+
+	ret = get_user(size, &uattr->size);  용도 : 유저 영역의 데이터를 커널 영역으로 복사
+					인자의 넘어온 변수의 길이만큼 복사한다.
+	if (ret)
+		return ret;
+
+	/* Bail out on silly large: */
+	if (size > PAGE_SIZE) // arch/alpha/include/asm/page.h PAGE_SIZE 13^2로 고정
+				PAGE_SIZE보다 큰 경우 복사 해온 데이터를 다시 유저 영역으로 넘긴다
+		goto err_size;  // err_size:
+				put_user(sizeof(*attr), &uattr->size); get_user와 반대로 커널 영역의 데이터를 유저 영역으로 복사 인자의 넘어온 변수의 길이만큼 복사
+				return -E2BIG; /* Argument list too long */
+
+	/* ABI compatibility quirk: */ 호환성문제
+	if (!size) size가 0이면 SCHED 구조체 크기로 정해줌
+		size = SCHED_ATTR_SIZE_VER0;  48 /* sizeof first published struct */
+
+	if (size < SCHED_ATTR_SIZE_VER0)  SCHED 구조체 크기보다 작으면 오류가 나므로 goto
+		goto err_size;
+
+	/*
+	 * If we're handed a bigger struct than we know of,
+	 * ensure all the unknown bits are 0 - i.e. new
+	 * user-space does not rely on any kernel feature
+	 * extensions we dont know about yet.
+	 */
+	if (size > sizeof(*attr)) { 만약 size가 우리가 아는 구조체 크기보다 큰 경우 모르는 모든 비트가 0인지 확인
+		unsigned char __user *addr;
+		unsigned char __user *end;
+		unsigned char val;
+
+		addr = (void __user *)uattr + sizeof(*attr);
+		end  = (void __user *)uattr + size;
+
+		for (; addr < end; addr++) { size와 구조체 크기만큼 get_user을 통해 비트 확인
+			ret = get_user(val, addr);
+			if (ret)
+				return ret;
+			if (val)
+				goto err_size;
+		}
+		size = sizeof(*attr);
+	}
+
+	ret = copy_from_user(attr, uattr, size); // get_user와 다르게 size를 지정하여 유저 영역의 데이터를 커널 영역으로 복사, 정상적 수행됐다면 0을 리턴한다 return 값에는 복사되지 않은 바이트 수가 들어간다.
+	if (ret)
+		return -EFAULT;  /* Bad address */
+
+	/*
+	 * XXX: Do we want to be lenient like existing syscalls; or do we want
+	 * to be strict and return an error on out-of-bounds values?
+	 */
+	attr->sched_nice = clamp(attr->sched_nice, MIN_NICE, MAX_NICE);
+			//nice를 MIN과 MAX사이의 값으로 변경되게 해준다.
+	return 0;
+
+err_size:
+	put_user(sizeof(*attr), &uattr->size);
+	return -E2BIG;
+}
+
+arch/alpha/include/asm/uaccess.h
+lines 59
+#define get_user(x, ptr) \  용도 : 유저 영역의 데이터를 커널 영역으로 복사
+			인자의 넘어온 변수의 길이만큼 복사한다.
+			성공하면 0 오류는 -EFAULT, 오류 발생시 변수 x가 0으로 설정
+  __get_user_check((x), (ptr), sizeof(*(ptr)))
+
+lines 102
+#define __get_user_check(x, ptr, size)				\
+({								\
+	long __gu_err = -EFAULT;				\ /* Bad address */
+	unsigned long __gu_val = 0;				\
+	const __typeof__(*(ptr)) __user *__gu_addr = (ptr);	\
+	if (__access_ok((unsigned long)__gu_addr, size)) {	\
+		__gu_err = 0;					\
+		switch (size) {					\
+		  case 1: __get_user_8(__gu_addr); break;	\
+		  case 2: __get_user_16(__gu_addr); break;	\
+		  case 4: __get_user_32(__gu_addr); break;	\
+		  case 8: __get_user_64(__gu_addr); break;	\
+		  default: __get_user_unknown(); break;		\
+		}						\
+	}							\
+	(x) = (__force __typeof__(*(ptr))) __gu_val;		\
+	__gu_err;						\
+})
+
+lines 57
+#define put_user(x, ptr) \  용도 : 커널 영역의 데이터를 유저 영역으로 복사
+			인자의 넘어온 변수의 길이만큼 복사한다.
+			성공하면 0 오류는 -EFAULT, 오류 발생시 변수 x가 0으로 설정
+  __put_user_check((__typeof__(*(ptr)))(x), (ptr), sizeof(*(ptr)))
+
+lines 198
+#define __put_user_check(x, ptr, size)				\
+({								\
+	long __pu_err = -EFAULT;				\/* Bad address */
+	__typeof__(*(ptr)) __user *__pu_addr = (ptr);		\
+	if (__access_ok((unsigned long)__pu_addr, size)) {	\
+		__pu_err = 0;					\
+		switch (size) {					\
+		  case 1: __put_user_8(x, __pu_addr); break;	\
+		  case 2: __put_user_16(x, __pu_addr); break;	\
+		  case 4: __put_user_32(x, __pu_addr); break;	\
+		  case 8: __put_user_64(x, __pu_addr); break;	\
+		  default: __put_user_unknown(); break;		\
+		}						\
+	}							\
+	__pu_err;						\
+})
+
+include/linux/uaccess.h
+lines 144
+copy_from_user(void *to, const void __user *from, unsigned long n)
+{
+	if (likely(check_copy_size(to, n, false))) // likely = if 분기문에서 True인 경우가 더 많을 것이라는 정보를 주어 성능 향상 시키는 함수
+
+		n = _copy_from_user(to, from, n);
+	return n;
+}
+
+include/linux/thread_info.h
+lines 138
+check_copy_size(const void *addr, size_t bytes, bool is_source)
+{
+	int sz = __compiletime_object_size(addr);
+	if (unlikely(sz >= 0 && sz < bytes)) { //likely 와 반대
+		if (!__builtin_constant_p(bytes))
+			copy_overflow(sz, bytes);
+		else if (is_source)
+			__bad_copy_from();
+		else
+			__bad_copy_to();
+		return false;
+	}
+	check_object_size(addr, bytes, is_source);
+	return true;
+}
+
+include/linux/uaccess.h
+lines 110
+#ifdef INLINE_COPY_FROM_USER // 이 옵션을 통해서 유저 어플리케이션에서 사용 될 때 인라인 함수로 제공, 커널에서 호출시에는 라이브러리를 통해 제공
+static inline unsigned long  
+_copy_from_user(void *to, const void __user *from, unsigned long n)
+{ //user address(from)에서 kernel address(to)로 nbytes(n)만큼 복사한다.
+	unsigned long res = n;
+	might_fault();
+	if (likely(access_ok(VERIFY_READ, from, n))) {
+		kasan_check_write(to, n);
+		res = raw_copy_from_user(to, from, n);
+	}
+	if (unlikely(res))
+		memset(to + (n - res), 0, res);
+	return res;
+} 정상적 수행됐다면 0을 리턴한다 return 값에는 복사되지 않은 바이트 수가 들어간다.
+#else
+extern unsigned long
+_copy_from_user(void *, const void __user *, unsigned long);
+#endif
+
+include/linux/rcupdate.h
+lines 627
+static inline void rcu_read_lock(void)  // RCU에서 데이터 참조를 위한 Critical Section을 시작 했다는 것을 통지
+{
+	__rcu_read_lock(); 
+	__acquire(RCU); // 읽기를 위한 잠금 권한을 획득한다. 읽는 것은 다수의 스레드에서 접근이 가능하므로 다른 CPU에서 rcu_read_lock() 함수를 이용하여 중첩해서 사용이 가능하다.
+	rcu_lock_acquire(&rcu_lock_map);
+	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+			 "rcu_read_lock() used illegally while idle");
+}
+
+lines 80
+static inline void __rcu_read_lock(void)
+{
+	if (IS_ENABLED(CONFIG_PREEMPT_COUNT))  
+		preempt_disable();  // CPU간의 선점을 방지한다.
+}
+
+lines 679
+static inline void rcu_read_unlock(void)
+{
+	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+			 "rcu_read_unlock() used illegally while idle");
+	__release(RCU);   // __acquire()에서 획득한 잠금을 해제한다.
+	__rcu_read_unlock();
+	rcu_lock_release(&rcu_lock_map); /* Keep acq info for rls diags. */
+}
+
+lines 86
+static inline void __rcu_read_unlock(void)
+{
+	if (IS_ENABLED(CONFIG_PREEMPT_COUNT))
+		preempt_enable(); // __rcu_read_lock에서 CPU간의 선점을 방지를 해제한다.
+}
+
+kernel/sched/core.c
+lines 4421
+int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
+{
+	return __sched_setscheduler(p, attr, true, true);
+}
+
+lines 4143
+static int __sched_setscheduler(struct task_struct *p, const struct sched_attr *attr, bool user, bool pi)
+{
+	int newprio = dl_policy(attr->sched_policy) ? MAX_DL_PRIO - 1 : // 정책이 deadline인지 확인 MAX_DL_PRIO = 0
+		      MAX_RT_PRIO - 1 - attr->sched_priority;
+	int retval, oldprio, oldpolicy = -1, queued, running;
+	int new_effective_prio, policy = attr->sched_policy;
+	const struct sched_class *prev_class;
+	struct rq_flags rf;
+	int reset_on_fork;
+	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+			// 0x02 /* Matches ENQUEUE_RESTORE */
+			//	0x04 /* Matches ENQUEUE_MOVE */
+			//		0x08 /* Matches ENQUEUE_NOCLOCK */
+	struct rq *rq;
+
+	/* The pi code expects interrupts enabled */
+	BUG_ON(pi && in_interrupt()); // in_interrupt()는 현재 실행 중인 코드가 interrupt context인지 true로 반환해준다. false는 process context
+recheck:
+	/* Double check policy once rq lock held: */
+	if (policy < 0) {
+		reset_on_fork = p->sched_reset_on_fork;
+		policy = oldpolicy = p->policy;
+	} else {
+		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
+
+		if (!valid_policy(policy)) // idle || fair(normal, batch) || rt(fifo, rr) || dl  인지 확인
+			return -EINVAL; // /* Invalid argument */
+	}
+			
+	if (attr->sched_flags & ~(SCHED_FLAG_ALL | SCHED_FLAG_SUGOV)) // attr->sched_flags & ~(0x01 | 0x02 | 0x04 | 0x10000000)
+						//
+		return -EINVAL;  /* Invalid argument */
+
+	/*
+	 * Valid priorities for SCHED_FIFO and SCHED_RR are
+	 * 1..MAX_USER_RT_PRIO-1, valid priority for SCHED_NORMAL,
+	 * SCHED_BATCH and SCHED_IDLE is 0.
+	 */
+	// mm_struct인 memory map mm변수  MAX_RT_PRIO와 MAX_USER_RT_PRIO는 100으로 매크로 되어있다.
+	if ((p->mm && attr->sched_priority > MAX_USER_RT_PRIO-1) || 
+	    (!p->mm && attr->sched_priority > MAX_RT_PRIO-1))		// sched_RT인 경우 우선순위가 100이 넘는 경우 오류를 검출한다.
+		return -EINVAL;  /* Invalid argument */ sched
+	if ((dl_policy(policy) && !__checkparam_dl(attr)) || 	// policy가 deadline 이면서 deaeline에서 매개변수나 deadline이 0인 경우, SCALE bit, MSB 설정 에러 등 에러 검출
+	    (rt_policy(policy) != (attr->sched_priority != 0))) // policy가 rt인 경우 우선순위가 0인 경우, rt가 아닌데 우선순위가 있는 경우 에러 검출
+		return -EINVAL;  /* Invalid argument */
+
+	/*
+	 * Allow unprivileged RT tasks to decrease priority:
+	 */   우선 순위를 높이고 다른 우선 순위를 설정하도록 허용, (다른 UID) 프로세스 자체적으로 FIFO 및 라운드 로빈 (실시간) 스케줄링 사용 허용, 다른 사람이 사용하는 스케줄링 알고리즘 처리 및 설정
+   방법.
+다른 프로세스에서 CPU 선호도 설정 허용
+	if (user && !capable(CAP_SYS_NICE)) {
+		if (fair_policy(policy)) { // fair인 경우 nice값이 -20~19 사이인지 체크
+			if (attr->sched_nice < task_nice(p) &&
+			    !can_nice(p, attr->sched_nice))
+				return -EPERM; /* Operation not permitted */
+		}
+
+		if (rt_policy(policy)) { // rt인 경우 우선순위 에러 체크
+			unsigned long rlim_rtprio =
+					task_rlimit(p, RLIMIT_RTPRIO);
+
+			/* Can't set/change the rt policy: */
+			if (policy != p->policy && !rlim_rtprio)
+				return -EPERM; /* Operation not permitted */
+
+			/* Can't increase priority: */
+			if (attr->sched_priority > p->rt_priority &&
+			    attr->sched_priority > rlim_rtprio)
+				return -EPERM; /* Operation not permitted */
+		}
+
+		 /*
+		  * Can't set/change SCHED_DEADLINE policy at all for now
+		  * (safest behavior); in the future we would like to allow
+		  * unprivileged DL tasks to increase their relative deadline
+		  * or reduce their runtime (both ways reducing utilization)
+		  */
+		if (dl_policy(policy)) // 여기서는 deadline 이용 x
+			return -EPERM; /* Operation not permitted */
+
+		/*
+		 * Treat SCHED_IDLE as nice 20. Only allow a switch to
+		 * SCHED_NORMAL if the RLIMIT_NICE would normally permit it.
+		 */
+		if (idle_policy(p->policy) && !idle_policy(policy)) { // idle은 nice 20으로 취급, nice값 에러  
+			if (!can_nice(p, task_nice(p)))
+				return -EPERM; /* Operation not permitted */
+		}
+
+		/* Can't change other user's priorities: */
+		if (!check_same_owner(p)) // 다른 유저 우선순위 건들기 x
+			return -EPERM; /* Operation not permitted */
+
+		/* Normal users shall not reset the sched_reset_on_fork flag: */
+		if (p->sched_reset_on_fork && !reset_on_fork) //   sched_reset_on_fork 리셋 x
+			return -EPERM; /* Operation not permitted */
+	}
+
+	if (user) {
+		if (attr->sched_flags & SCHED_FLAG_SUGOV)
+			return -EINVAL; /* Invalid argument */
+
+		retval = security_task_setscheduler(p); // cpuset을 사용할 수 있는지 확인
+		if (retval)
+			return retval;
+	}
+
+	/*
+	 * Make sure no PI-waiters arrive (or leave) while we are
+	 * changing the priority of the task:
+	 *
+	 * To be able to change p->policy safely, the appropriate
+	 * runqueue lock must be held.
+	 */
+	rq = task_rq_lock(p, &rf); // policy을 바꿀 때 PI waiter가 사라지지 않도록 런큐를 잠근다.
+	update_rq_clock(rq);
+
+	/*
+	 * Changing the policy of the stop threads its a very bad idea:
+	 */
+	if (p == rq->stop) { 스레드 정지정책 바뀌면 에러
+		task_rq_unlock(rq, p, &rf);
+		return -EINVAL; /* Invalid argument */
+	}
+
+	/*
+	 * If not changing anything there's no need to proceed further,
+	 * but store a possible modification of reset_on_fork.
+	 */
+	if (unlikely(policy == p->policy)) {
+		if (fair_policy(policy) && attr->sched_nice != task_nice(p)) fair 이면서 nice가 변경되었다면 goto
+			goto change;
+		if (rt_policy(policy) && attr->sched_priority != p->rt_priority) rt 이면서 우선순위가 변경되었다면 goto
+			goto change;
+		if (dl_policy(policy) && dl_param_changed(p, attr)) deadline이면서 매개변수 변하면 goto
+			goto change;
+
+		p->sched_reset_on_fork = reset_on_fork; // 아무것도 바꾸지 않았을 때도 따로 저장해서 관리
+		task_rq_unlock(rq, p, &rf);
+		return 0;
+	}
+change:
+
+	if (user) {
+#ifdef CONFIG_RT_GROUP_SCHED // cgroup의 rt 그룹 스케줄링을 지원하는 커널 옵션
+		/*
+		 * Do not allow realtime tasks into groups that have no runtime
+		 * assigned.
+		 */
+		if (rt_bandwidth_enabled() && rt_policy(policy) && // 런타임 작업 그룹이 할당되어 있지 않으면서 rt일 경우 에러
+				task_group(p)->rt_bandwidth.rt_runtime == 0 &&
+				!task_group_is_autogroup(task_group(p))) {
+			task_rq_unlock(rq, p, &rf);
+			return -EPERM; /* Operation not permitted */
+		}
+#endif
+#ifdef CONFIG_SMP // Symmetric multiprocessing 개별적으로 연산이 돌아감
+		if (dl_bandwidth_enabled() && dl_policy(policy) && //dl이면서 대역폭 존재 
+				!(attr->sched_flags & SCHED_FLAG_SUGOV)) { // dl 에러 검출x 시
+			cpumask_t *span = rq->rd->span;
+
+			/*
+			 * Don't allow tasks with an affinity mask smaller than
+			 * the entire root_domain to become SCHED_DEADLINE. We
+			 * will also fail if there's no bandwidth available.
+			 */
+			if (!cpumask_subset(span, &p->cpus_allowed) || // cpumask < root_domain이거나
+			    rq->rd->dl_bw.bw == 0) { // 런큐에 대역폭이 없으면 에러
+				task_rq_unlock(rq, p, &rf);
+				return -EPERM; /* Operation not permitted */
+			}
+		}
+#endif
+	}
+
+	/* Re-check policy now with rq lock held: */
+	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) { // 다시 한번 체크해보기 위한 goto
+		policy = oldpolicy = -1;
+		task_rq_unlock(rq, p, &rf);
+		goto recheck;
+	}
+
+	/*
+	 * If setscheduling to SCHED_DEADLINE (or changing the parameters
+	 * of a SCHED_DEADLINE task) we need to check if enough bandwidth
+	 * is available.
+	 */
+	if ((dl_policy(policy) || dl_task(p)) && sched_dl_overflow(p, policy, attr)) { //deadline으로 바꾸거나 매개변수를 바꾸는 경우에 충분한 대역폭이 있나 확인하기
+		task_rq_unlock(rq, p, &rf);
+		return -EBUSY;
+	}
+
+	p->sched_reset_on_fork = reset_on_fork; // 현재 스케쥴링과 우선순위를 이전 변수에 넣는다.
+	oldprio = p->prio;
+
+	if (pi) {
+		/*
+		 * Take priority boosted tasks into account. If the new
+		 * effective priority is unchanged, we just store the new
+		 * normal parameters and do not touch the scheduler class and
+		 * the runqueue. This will be done when the task deboost
+		 * itself.
+		 */
+		new_effective_prio = rt_effective_prio(p, newprio); // rt의 새 우선순위 할당
+		if (new_effective_prio == oldprio) // 전 우선순위와 같다면 그대로 유지
+			queue_flags &= ~DEQUEUE_MOVE;
+	}
+
+	queued = task_on_rq_queued(p); // p가 런큐에 큐 되어 있나
+	running = task_current(rq, p); // 현재 런큐에 올라가있나
+	if (queued)
+		dequeue_task(rq, p, queue_flags); 프로세스가 더이상 실행 가능할 상태가 아닐 때
+	if (running)
+		put_prev_task(rq, p); 실행중인 테스크를 다시 queue에 넣는다
+
+	prev_class = p->sched_class; 현재 클래스를 prev에 저장
+	__setscheduler(rq, p, attr, pi); 스케쥴러를 설정한다.
+
+	if (queued) {
+		/*
+		 * We enqueue to tail when the priority of a task is
+		 * increased (user space view).
+		 */
+		if (oldprio < p->prio) // 바뀐 우선순위가 더 큰 경우 큐에서 자리를 바꿔준다.
+			queue_flags |= ENQUEUE_HEAD;
+
+		enqueue_task(rq, p, queue_flags); // 프로세스가 실행가능한 상태로 들어간다.
+	}
+	if (running)
+		set_curr_task(rq, p); 테스크의 스케쥴링 클래스나 태스크 그룹을 바꿀때
+
+	check_class_changed(rq, p, prev_class, oldprio); // 전 클래스와 전 우선순위로 현재의 클래스와 우선순위를 비교하여 제대로 바뀌었는지 확인
+
+	/* Avoid rq from going away on us: */
+	preempt_disable(); //선점 지연 비활성화
+	task_rq_unlock(rq, p, &rf); // policy을 바꿨으니 잠금을 해제한다.
+
+	if (pi)
+		rt_mutex_adjust_pi(p); // 우선순위 설정을 한 경우에 pi체인을 다시 확인함
+
+	/* Run balance callbacks after we've adjusted the PI chain: */
+	balance_callback(rq); // 선점 지연 비활성화 상태에서 런큐 밸런스 맞춤
+	preempt_enable(); //선점 지연 활성화
+
+	return 0;
+}
+
+kernel/sched/sched.h
+
+static inline int idle_policy(int policy)
+{
+	return policy == SCHED_IDLE;
+}
+static inline int fair_policy(int policy)
+{
+	return policy == SCHED_NORMAL || policy == SCHED_BATCH;
+}
+
+static inline int rt_policy(int policy)
+{
+	return policy == SCHED_FIFO || policy == SCHED_RR;
+}
+
+static inline int dl_policy(int policy)
+{
+	return policy == SCHED_DEADLINE;
+}
+static inline bool valid_policy(int policy)
+{
+	return idle_policy(policy) || fair_policy(policy) ||
+		rt_policy(policy) || dl_policy(policy);
+}
+
+kernel/sched/core.c
+lines 4106
+static void __setscheduler(struct rq *rq, struct task_struct *p,
+			   const struct sched_attr *attr, bool keep_boost)
+{
+	__setscheduler_params(p, attr);
+
+	/*
+	 * Keep a potential priority boosting if called from
+	 * sched_setscheduler().
+	 */
+	p->prio = normal_prio(p); // task의 우선순위를 각 정책에 맞게 맞춰주고
+	if (keep_boost) // pi가 true인 경우 즉 향상된 우선순위를 제공한 경우
+		p->prio = rt_effective_prio(p, p->prio);
+
+	if (dl_prio(p->prio)) // 각각 설정한 스케쥴링 정책에 맞게 클래스도 변경한다.
+		p->sched_class = &dl_sched_class;
+	else if (rt_prio(p->prio))
+		p->sched_class = &rt_sched_class;
+	else
+		p->sched_class = &fair_sched_class;
+}
+
+lines 4080
+static void __setscheduler_params(struct task_struct *p,
+		const struct sched_attr *attr)
+{
+	int policy = attr->sched_policy; // policy에 받아온 policy를 넣는다
+
+	if (policy == SETPARAM_POLICY) // setparam_policy은 -1로 -1 인 경우에는 함수가 변경하지 않도록 해줌
+		policy = p->policy;
+
+	p->policy = policy; // task의 policy를 현재 policy로 바꿔주고
+
+	if (dl_policy(policy))  // dl인경우 dl에 맞는 매개변수(runtime, deadline, period, flags, bw, density)를 맞춰준다
+		__setparam_dl(p, attr);
+	else if (fair_policy(policy)) // fair인 경우 현재 nice에서 default prio를 더해주는데 이 때 default prio는 120값을 가진다 (nice 범위 -20~19 = 40, MAX_RT_PRIO = 100, 100 + 20) 이 것을 static_prio에 넣어준다.
+		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+
+	/*
+	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+	 * !rt_policy. Always setting this ensures that things like
+	 * getparam()/getattr() don't report silly values for !rt tasks.
+	 */
+	p->rt_priority = attr->sched_priority;
+	p->normal_prio = normal_prio(p); // policy가 무엇이냐에 따라서 각각 최대 우선순위에서 1을 뺀 값을 넣어준다
+	set_load_weight(p, true); // load_weight란 공정한 cpu시간을 할당하기 위하여 우선순위의 비율을 정한 것이다.  위에서 하지 않은 정책들인 Idle과 other인 경우에 필요한 load_weight을 설정해준다.
+}
